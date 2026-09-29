@@ -1,15 +1,18 @@
 """
 price_watch.py
 ================
-يقرأ صفحات مواقع تجميع المنشورات (confrontavolantini.com و
-anteprimavolantino.it) لمحلات محددة، يستخرج أسعار فئات منتجات معيّنة
-(زيت، بيض، صلصة طماطم، طماطم/خضار، فواكه)، ويبني جدول مقارنة: أفضل
-سعر، الكمية، والمحل.
+يقرأ صفحات مواقع تجميع المنشورات، يستخرج أسعار فئات منتجات معيّنة
+(زيت، بيض، صلصة طماطم، طماطم/خضار، فواكه)، ويبني جدول مقارنة.
 
-⚠️ هذا سكربت "أفضل محاولة" (best-effort): بُني على نمط النص الملاحظ
-بنتائج البحث (مثال: "Olio extra vergine di oliva Desantis (3 L): 13,99 €
-— pag. 1")، لكنه ما تحقق منه على اتصال إنترنت حي بعد. أول تشغيل له
-لازم يُراجع يدويًا قبل ما يُعتمد عليه — بالضبط زي ما اتفقنا.
+بُني على فحص فعلي لبنية الصفحات الحقيقية (مو تخمين):
+- Eurospin/Lidl/Pam/Penny على confrontavolantini.com: صفحة نصية منظمة
+  بشكل "- اسم المنتج (كمية): X,XX € — pag. N" تحت عناوين فئات "### ...".
+  هذي ثقة عالية.
+- Il Gigante/TIGROS على anteprimavolantino.it: لا توجد صفحة منظمة، فقط
+  صفحة تصنيف ثابتة نجيب منها رابط آخر مقال، والمقال نثر عادي يذكر أسعار
+  متفرقة داخل الجمل. ثقة أقل، ونعلّمها بوضوح بالتقرير.
+- D-più: كل المصادر المفحوصة (confrontavolantini, anteprimavolantino,
+  kimbino, doveconviene) تعرضه كصور تُقلّب فقط، بدون نص. غير مغطى آليًا.
 """
 
 import re
@@ -17,121 +20,177 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 
-# المحلات المستهدفة وروابط صفحاتها على مواقع تجميع المنشورات
-STORES = {
-    "Eurospin": "https://confrontavolantini.com/eurospin",
-    "Lidl": "https://confrontavolantini.com/anteprima/anteprima-nuovo-volantino-lidl",
-    "Pam": "https://confrontavolantini.com/anteprima/anteprima-nuovo-volantino-pam",
-    "Penny": "https://confrontavolantini.com/anteprima/anteprima-nuovo-volantino-penny",
-    "Il Gigante": "https://www.anteprimavolantino.it/?s=il+gigante",
-    "TIGROS": "https://www.anteprimavolantino.it/?s=tigros",
-    "D-più": "https://www.anteprimavolantino.it/?s=d-piu",
+HEADERS = {"User-Agent": "Mozilla/5.0 (Se3ra price-watch bot; personal project)"}
+
+# ---------------------------------------------------------------------------
+# مصادر ثقة عالية: نص منظم بشكل ثابت
+HIGH_CONFIDENCE_STORES = {
+    "Eurospin": "https://confrontavolantini.com/anteprima/anteprima-nuovo-volantino-eurospin",
+    "Lidl":     "https://confrontavolantini.com/anteprima/anteprima-nuovo-volantino-lidl",
+    "Pam":      "https://confrontavolantini.com/anteprima/anteprima-nuovo-volantino-pam",
+    "Penny":    "https://confrontavolantini.com/anteprima/anteprima-nuovo-volantino-penny",
+    "Ipercoop": "https://confrontavolantini.com/anteprima/anteprima-nuovo-volantino-ipercoop",
 }
 
-# فئات المنتجات المستهدفة، وكلمات البحث الإيطالية اللي تدل عليها
-CATEGORIES = {
-    "زيت":        ["olio"],
-    "بيض":        ["uova", "uovo"],
-    "صلصة طماطم": ["passata", "polpa di pomodoro", "pomodoro a pezzetti"],
-    "طماطم/خضار": ["pomodori", "pomodoro", "zucchine", "insalata", "verdura"],
-    "فواكه":      ["mele", "uva", "arance", "pesche", "banane", "frutta"],
+# مصادر ثقة أقل: صفحة تصنيف ثابتة تودّي لمقال متجدد أسبوعيًا، نص نثري
+LOW_CONFIDENCE_STORES = {
+    "Il Gigante": "https://www.anteprimavolantino.it/il-gigante/",
+    "TIGROS":     "https://www.anteprimavolantino.it/tigros/",
 }
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Se3ra price-watch bot; contact: personal project)"}
+# غير مغطى آليًا (صور فقط بكل المصادر المفحوصة) — يُذكر بالتقرير فقط
+UNSUPPORTED_STORES = ["D-più"]
 
-# نمط استخراج: "اسم المنتج (كمية): سعر € — pag. رقم"
-# مبني على الشكل الملاحظ بمصادر confrontavolantini.com
-PRICE_PATTERN = re.compile(
-    r"([A-Za-zÀ-ÿ0-9\s'\.\-]{4,80}?)"      # اسم المنتج
-    r"\s*\(?([\d.,]+\s?(?:g|kg|ml|l|L|pz))?\)?"  # الكمية (اختيارية)
-    r"\s*:?\s*([\d]+,[\d]{2})\s*€",         # السعر
+# فئات المنتجات، بترتيب أولوية: أول فئة تطابق اسم المنتج تفوز، وما نكرر
+# المنتج بفئة ثانية (يحل مشكلة "Passata di pomodoro" اللي كانت تتكرر).
+CATEGORY_PRIORITY = [
+    ("صلصة طماطم", ["passata", "polpa di pomodoro", "sugo"]),
+    ("زيت",        ["olio"]),
+    ("بيض",        ["uova", "uovo"]),
+    ("فواكه",      ["mele", "uva", "arance", "pesche", "banane", "kiwi", "mirtilli",
+                     "susine", "ananas", "limoni", "avocado", "frutta"]),
+    ("طماطم/خضار", ["pomodor", "zucchine", "insalata", "verdura", "cipolle",
+                     "patate", "melanzane", "spinaci", "cetrioli", "funghi"]),
+]
+
+# نمط السطر المنظم بصفحات confrontavolantini.com:
+# "- اسم المنتج (كمية): 1,99 € — pag. 3"  (الكمية اختيارية)
+STRUCTURED_LINE = re.compile(
+    r"^-\s*(?P<name>.+?)(?:\s*\((?P<qty>[^)]+)\))?\s*:\s*(?P<price>[\d]+,[\d]{2})\s*€",
+    re.UNICODE
+)
+
+# نمط فضفاض للنثر بصفحات anteprimavolantino.it: "... اسم قبل السعر ... a 4,29 euro"
+PROSE_PRICE = re.compile(
+    r"([A-ZÀ-Ý][A-Za-zÀ-ÿ'\s]{3,50}?)\s+(?:è\s+|sono\s+|costa\s+|costano\s+)?a\s+([\d]+[,.][\d]{2})\s*(?:€|euro)",
     re.UNICODE
 )
 
 
-def fetch_page_text(url: str) -> str:
-    """يجيب نص الصفحة الخام. يرجع نص فاضي عند أي فشل، بدل ما يوقف السكربت كامل."""
+def categorize(name: str) -> str | None:
+    lowered = name.lower()
+    for category, keywords in CATEGORY_PRIORITY:
+        if any(kw in lowered for kw in keywords):
+            return category
+    return None
+
+
+def fetch_text(url: str) -> str:
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
-        # نشيل السكربتات والستايلات عشان ما تلخبط النص
         for tag in soup(["script", "style", "nav", "footer"]):
             tag.decompose()
-        return soup.get_text(separator=" ", strip=True)
+        return soup.get_text(separator="\n", strip=True)
     except requests.exceptions.RequestException as e:
         print(f"   ⚠️ فشل تحميل {url}: {e}")
         return ""
 
 
-def extract_matching_products(text: str, keywords: list[str]) -> list[dict]:
-    """يدوّر داخل النص على أي جملة تحتوي كلمة مفتاحية، ويحاول يستخرج منها
-    اسم المنتج والكمية والسعر حسب النمط."""
-    results = []
-    lowered_text = text.lower()
-    for kw in keywords:
-        idx = 0
-        while True:
-            pos = lowered_text.find(kw, idx)
-            if pos == -1:
-                break
-            # ناخذ مقطع نص حوالين الكلمة المفتاحية عشان نلقى فيه السعر
-            snippet = text[max(0, pos - 60): pos + 100]
-            match = PRICE_PATTERN.search(snippet)
-            if match:
-                name, qty, price = match.groups()
-                results.append({
-                    "name": name.strip(" -–:"),
-                    "qty": (qty or "غير محدد").strip(),
-                    "price": float(price.replace(",", ".")),
-                })
-            idx = pos + len(kw)
-    return results
+def parse_high_confidence(text: str, store: str) -> list[dict]:
+    """يقرأ الأسطر المنظمة '- اسم (كمية): سعر € — pag. N'."""
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("-"):
+            continue
+        m = STRUCTURED_LINE.match(line)
+        if not m:
+            continue
+        name = m.group("name").strip()
+        category = categorize(name)
+        if category is None:
+            continue
+        rows.append({
+            "category": category,
+            "store": store,
+            "name": name,
+            "qty": (m.group("qty") or "غير محدد").strip(),
+            "price": float(m.group("price").replace(",", ".")),
+            "confidence": "عالية",
+        })
+    return rows
+
+
+def find_latest_article_url(category_page_html: str, base_url: str) -> str | None:
+    """يدوّر على أول رابط مقال 'volantino-<slug>' داخل صفحة التصنيف."""
+    m = re.search(r'href="(https://www\.anteprimavolantino\.it/\d+/volantino-[^"]+)"', category_page_html)
+    return m.group(1) if m else None
+
+
+def parse_low_confidence(text: str, store: str) -> list[dict]:
+    """يستخرج أسعار من نص نثري بنمط فضفاض — أقل دقة، لازم مراجعة يدوية."""
+    rows = []
+    for m in PROSE_PRICE.finditer(text):
+        name = m.group(1).strip()
+        category = categorize(name)
+        if category is None:
+            continue
+        rows.append({
+            "category": category,
+            "store": store,
+            "name": name,
+            "qty": "غير محدد",
+            "price": float(m.group(2).replace(",", ".")),
+            "confidence": "⚠️ منخفضة (نص نثري)",
+        })
+    return rows
 
 
 def run_price_watch() -> list[dict]:
     all_rows = []
-    for store_name, url in STORES.items():
-        print(f"🔍 {store_name}: {url}")
-        text = fetch_page_text(url)
-        if not text:
+
+    for store, url in HIGH_CONFIDENCE_STORES.items():
+        print(f"🔍 [ثقة عالية] {store}: {url}")
+        text = fetch_text(url)
+        if text:
+            rows = parse_high_confidence(text, store)
+            print(f"   ✅ لُقي {len(rows)} منتج مطابق")
+            all_rows.extend(rows)
+
+    for store, category_page in LOW_CONFIDENCE_STORES.items():
+        print(f"🔍 [ثقة منخفضة] {store}: {category_page}")
+        try:
+            r = requests.get(category_page, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            article_url = find_latest_article_url(r.text, category_page)
+        except requests.exceptions.RequestException as e:
+            print(f"   ⚠️ فشل تحميل صفحة التصنيف: {e}")
             continue
-        for category, keywords in CATEGORIES.items():
-            products = extract_matching_products(text, keywords)
-            for p in products:
-                all_rows.append({
-                    "category": category,
-                    "store": store_name,
-                    "name": p["name"],
-                    "qty": p["qty"],
-                    "price": p["price"],
-                    "source": url,
-                })
+        if not article_url:
+            print("   ⚠️ ما لقيت رابط أحدث مقال")
+            continue
+        print(f"   → أحدث مقال: {article_url}")
+        text = fetch_text(article_url)
+        if text:
+            rows = parse_low_confidence(text, store)
+            print(f"   ⚠️ لُقي {len(rows)} منتج مطابق (يحتاج مراجعة)")
+            all_rows.extend(rows)
+
     return all_rows
 
 
-def build_best_price_report(rows: list[dict]) -> str:
-    """يبني تقرير نصي: أفضل سعر لكل فئة، مع الكمية والمحل، مرتب حسب الفئة."""
+def build_report(rows: list[dict]) -> str:
+    lines = [f"📋 تقرير أسعار سعرة — {datetime.now().strftime('%Y-%m-%d')}", "=" * 40]
+
     if not rows:
-        return "❌ ما انسحب أي منتج. راجع الروابط والنمط قبل الاعتماد على السكربت."
+        lines.append("❌ ما انسحب أي منتج هالمرة. راجع الروابط قبل الاعتماد على التقرير.")
+    else:
+        categories = sorted(set(r["category"] for r in rows))
+        for cat in categories:
+            cat_rows = sorted([r for r in rows if r["category"] == cat], key=lambda r: r["price"])
+            lines.append(f"\n🏷️ {cat}:")
+            for r in cat_rows[:5]:
+                lines.append(f"   {r['price']:.2f}€ — {r['name']} ({r['qty']}) — {r['store']} [{r['confidence']}]")
 
-    report_lines = [f"📋 تقرير أسعار — {datetime.now().strftime('%Y-%m-%d')}\n" + "=" * 40]
-    categories_seen = sorted(set(r["category"] for r in rows))
-
-    for cat in categories_seen:
-        cat_rows = sorted([r for r in rows if r["category"] == cat], key=lambda r: r["price"])
-        report_lines.append(f"\n🏷️ {cat}:")
-        for r in cat_rows[:5]:  # أفضل 5 نتائج بكل فئة
-            report_lines.append(
-                f"   {r['price']:.2f}€ — {r['name']} ({r['qty']}) — {r['store']}"
-            )
-
-    report_lines.append("\n" + "=" * 40)
-    report_lines.append("⚠️ راجع هذي الأسعار يدويًا قبل التسوق — السكربت قد يخطئ بالاستخراج.")
-    return "\n".join(report_lines)
+    lines.append("\n" + "=" * 40)
+    lines.append(f"❌ غير مغطى آليًا (يحتاج متابعة يدوية): {', '.join(UNSUPPORTED_STORES)}")
+    lines.append("⚠️ راجع كل الأسعار يدويًا قبل التسوق، خصوصًا المعلّمة بثقة منخفضة.")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
     rows = run_price_watch()
-    print("\n" + build_best_price_report(rows))
+    print("\n" + build_report(rows))
 
