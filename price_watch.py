@@ -53,10 +53,13 @@ CATEGORY_PRIORITY = [
                      "patate", "melanzane", "spinaci", "cetrioli", "funghi"]),
 ]
 
-# نمط السطر المنظم بصفحات confrontavolantini.com:
-# "- اسم المنتج (كمية): 1,99 € — pag. 3"  (الكمية اختيارية)
+# نمط السطر المنظم: "اسم المنتج (كمية): 1,99 € — pag. 3"
+# ملاحظة: BeautifulSoup ما يضيف شرطة "-" لعناصر القوائم، عكس أدوات
+# التصفح اللي تحوّل HTML لماركداون. النمط هنا لا يشترط شرطة بالبداية،
+# ويعتمد بدلها على وجود "pag." بآخر السطر كدليل إنه فعلاً سطر منتج.
 STRUCTURED_LINE = re.compile(
-    r"^-\s*(?P<name>.+?)(?:\s*\((?P<qty>[^)]+)\))?\s*:\s*(?P<price>[\d]+,[\d]{2})\s*€",
+    r"^(?:-\s*)?(?P<name>.+?)(?:\s*\((?P<qty>[^)]+)\))?\s*:\s*"
+    r"(?P<price>[\d]+,[\d]{2})\s*€.*?pag\.\s*\d+",
     re.UNICODE
 )
 
@@ -93,11 +96,11 @@ def fetch_text(url: str) -> str:
 
 
 def parse_high_confidence(text: str, store: str) -> list[dict]:
-    """يقرأ الأسطر المنظمة '- اسم (كمية): سعر € — pag. N'."""
+    """يقرأ الأسطر المنظمة 'اسم (كمية): سعر € — pag. N'."""
     rows = []
     for line in text.splitlines():
         line = line.strip()
-        if not line.startswith("-"):
+        if not line or "pag." not in line or "€" not in line:
             continue
         m = STRUCTURED_LINE.match(line)
         if not m:
