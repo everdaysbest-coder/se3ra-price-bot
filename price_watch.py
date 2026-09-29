@@ -78,11 +78,15 @@ def categorize(name: str) -> str | None:
 def fetch_text(url: str) -> str:
     try:
         r = requests.get(url, headers=HEADERS, timeout=20)
+        print(f"      [تشخيص] كود الرد: {r.status_code} | طول المحتوى الخام: {len(r.text)} حرف")
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer"]):
             tag.decompose()
-        return soup.get_text(separator="\n", strip=True)
+        clean_text = soup.get_text(separator="\n", strip=True)
+        print(f"      [تشخيص] طول النص بعد التنظيف: {len(clean_text)} حرف")
+        print(f"      [تشخيص] أول 300 حرف: {clean_text[:300]!r}")
+        return clean_text
     except requests.exceptions.RequestException as e:
         print(f"   ⚠️ فشل تحميل {url}: {e}")
         return ""
@@ -193,4 +197,3 @@ def build_report(rows: list[dict]) -> str:
 if __name__ == "__main__":
     rows = run_price_watch()
     print("\n" + build_report(rows))
-
