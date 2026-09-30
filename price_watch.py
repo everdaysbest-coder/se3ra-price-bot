@@ -63,19 +63,27 @@ STRUCTURED_LINE = re.compile(
     re.UNICODE
 )
 
-# نمط فضفاض للنثر بصفحات anteprimavolantino.it: "... اسم قبل السعر ... a 4,29 euro"
+# نمط النثر بصفحات anteprimavolantino.it، مبني على فحص فعلي لمقال حقيقي:
+# الشكل السائد هو "اسم المنتج da الكمية a السعر €"
+# مثال حقيقي: "l'olio extravergine di oliva classico Monini da 450 ml a 3,89 €"
 PROSE_PRICE = re.compile(
-    r"([A-ZÀ-Ý][A-Za-zÀ-ÿ'\s]{3,50}?)\s+(?:è\s+|sono\s+|costa\s+|costano\s+)?a\s+([\d]+[,.][\d]{2})\s*(?:€|euro)",
+    r"([^,.:;\n]{3,100}?)\s+da\s+"
+    r"(?:[\d]+(?:[.,]\d+)?\s?(?:g|kg|ml|l|litro|litri)|un\s+(?:litro|chilo|kg))"
+    r"\s+a\s+([\d]+,[\d]{2})\s*€",
     re.UNICODE
 )
 
 
-def categorize(name: str) -> str | None:
+def categorize(name: str) -> str:
+    """يحاول يحط المنتج بفئة معروفة، ولو ما طابق أي كلمة مفتاحية يرجعه
+    تحت 'أخرى' بدل ما يتجاهله — الهدف نلتقط كل منتج له سعر، مو فقط
+    فئاتنا الخمسة الأصلية."""
     lowered = name.lower()
     for category, keywords in CATEGORY_PRIORITY:
-        if any(kw in lowered for kw in keywords):
-            return category
-    return None
+        for kw in keywords:
+            if re.search(r"\b" + re.escape(kw), lowered):
+                return category
+    return "أخرى"
 
 
 def fetch_text(url: str) -> str:
@@ -107,8 +115,6 @@ def parse_high_confidence(text: str, store: str) -> list[dict]:
             continue
         name = m.group("name").strip()
         category = categorize(name)
-        if category is None:
-            continue
         rows.append({
             "category": category,
             "store": store,
@@ -132,8 +138,6 @@ def parse_low_confidence(text: str, store: str) -> list[dict]:
     for m in PROSE_PRICE.finditer(text):
         name = m.group(1).strip()
         category = categorize(name)
-        if category is None:
-            continue
         rows.append({
             "category": category,
             "store": store,
@@ -184,12 +188,23 @@ def build_report(rows: list[dict]) -> str:
     if not rows:
         lines.append("❌ ما انسحب أي منتج هالمرة. راجع الروابط قبل الاعتماد على التقرير.")
     else:
-        categories = sorted(set(r["category"] for r in rows))
-        for cat in categories:
-            cat_rows = sorted([r for r in rows if r["category"] == cat], key=lambda r: r["price"])
-            lines.append(f"\n🏷️ {cat}:")
-            for r in cat_rows[:5]:
-                lines.append(f"   {r['price']:.2f}€ — {r['name']} ({r['qty']}) — {r['store']} [{r['confidence']}]")
+        lines.append(f"📦 إجمالي المنتجات المكتشفة: {len(rows)}")
+
+        # كل المحلات اللي عندها منتجات فعلية، بترتيب: عالية الثقة أول، بعدين منخفضة الثقة
+        stores_with_data = sorted(set(r["store"] for r in rows))
+        high_conf_names = list(HIGH_CONFIDENCE_STORES.keys())
+        low_conf_names = list(LOW_CONFIDENCE_STORES.keys())
+        ordered_stores = (
+            [s for s in high_conf_names if s in stores_with_data]
+            + [s for s in low_conf_names if s in stores_with_data]
+            + [s for s in stores_with_data if s not in high_conf_names and s not in low_conf_names]
+        )
+
+        for store in ordered_stores:
+            store_rows = sorted([r for r in rows if r["store"] == store], key=lambda r: r["price"])
+            lines.append(f"\n🏪 {store} ({len(store_rows)} منتج):")
+            for r in store_rows:
+                lines.append(f"   {r['price']:.2f}€ — {r['name']} ({r['qty']}) [{r['confidence']}]")
 
     lines.append("\n" + "=" * 40)
     lines.append(f"❌ غير مغطى آليًا (يحتاج متابعة يدوية): {', '.join(UNSUPPORTED_STORES)}")
